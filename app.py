@@ -6,7 +6,7 @@ import httpx
 
 # --- CONFIGURATION ---
 GITHUB_BOT_URL = "https://raw.githubusercontent.com/nkarthikraja-32/bot/main/bots.txt"
-PORT = 80
+PORT = int(os.environ.get("PORT", 80))
 MAX_CONCURRENT = 500          # simultaneous outbound requests
 BOT_CMD_DURATION = 5          # fixed duration sent to each bot
 
